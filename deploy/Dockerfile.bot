@@ -1,0 +1,34 @@
+FROM python:3.11-slim
+
+# Prevent Python from writing pyc files and buffering stdout
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PIP_NO_CACHE_DIR=1
+
+WORKDIR /app
+
+# Create a non-root user for security
+RUN addgroup --system --gid 1001 botgroup && \
+    adduser --system --uid 1001 --gid 1001 botuser
+
+# Install dependencies
+RUN pip install --upgrade pip && \
+    pip install \
+    pyTelegramBotAPI \
+    feedparser \
+    requests
+
+# Copy source code
+COPY src/telegram.py .
+
+# Create data directory and set permissions
+RUN mkdir -p /app/data && \
+    chown -R botuser:botgroup /app
+
+# Switch to non-root user
+USER botuser
+
+# Define volume for persistence
+VOLUME ["/app/data"]
+
+CMD ["python", "telegram.py"]

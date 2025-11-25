@@ -1,33 +1,64 @@
 import contextlib
+import logging
 import re
 import statistics
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
-import requests
+import httpx
 import torch
 import torch.nn.functional as F
 from bs4 import BeautifulSoup
-from fastapi import FastAPI, HTTPException
+from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
+from pydantic_settings import BaseSettings
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
-# --- Configuration ---
-MODEL_PATH = "../models/final_ai_detector"
-BASE_MODEL_NAME = "ai-forever/sbert_large_mt_nlu_ru"
-WINDOW_SIZE = 3
-STRIDE = 1
-MIN_WORDS = 10
 
-# Global storage for model and tokenizer
-ml_models = {}
-
-
-# --- Data Models ---
-class AnalyzeRequest(BaseModel):
-    url: Optional[str] = Field(None, description="URL статьи для проверки")
-    text: Optional[str] = Field(
-        None, description="Сырой текст для проверки (если нет URL)"
+# --- 1. Configuration (Cloud Ready) ---
+class Settings(BaseSettings):
+    # Model Config
+    hf_model_id: str = "viktor02/sbert_classification_ru_ai_texts"
+    model_path: str = Field(
+        default="viktor02/sbert_classification_ru_ai_texts",
+        validation_alias="MODEL_PATH",
     )
+
+    # Inference Config
+    window_size: int = 3
+    stride: int = 1
+    min_words: int = 10
+    batch_size: int = 16
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+
+    # App Config
+    log_level: str = "INFO"
+
+
+settings = Settings()
+
+# --- 2. Logging Setup ---
+logging.basicConfig(
+    level=settings.log_level,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger("api")
+
+
+# --- 3. Global State ---
+class MLResources:
+    model = None
+    tokenizer = None
+    device = None
+
+
+ml_resources = MLResources()
+
+
+# --- 4. Data Models ---
+class AnalyzeRequest(BaseModel):
+    url: Optional[str] = Field(None, description="URL of the article to check")
+    text: Optional[str] = Field(None, description="Raw text to check (if no URL)")
 
 
 class ChunkScore(BaseModel):
@@ -44,124 +75,93 @@ class AnalyzeResponse(BaseModel):
     total_chunks: int
     suspicious_chunks_count: int
     top_suspicious_chunks: List[ChunkScore]
+    processing_time_ms: Optional[float] = None
 
 
-# --- Helper Functions ---
-def clean_html(html_content):
+# --- 5. Helper Functions ---
+
+
+def clean_html_sync(html_content: str) -> str:
+    """CPU-bound HTML cleaning."""
     if not html_content:
         return ""
     soup = BeautifulSoup(html_content, "html.parser")
+
+    # Remove unwanted tags
     for element in soup(
         ["script", "style", "meta", "noscript", "iframe", "svg", "path"]
     ):
         element.decompose()
+
+    # Remove code blocks (optional, based on your logic)
     for element in soup(["pre", "code"]):
         element.decompose()
+
     text = soup.get_text(separator=" ", strip=True)
     return " ".join(text.split())
 
 
-def split_into_sentences(text):
+def split_into_sentences(text: str) -> List[str]:
+    # Improved regex to handle common abbreviations could go here,
+    # but keeping it simple for performance.
     sentences = re.split(r"(?<=[.!?])\s+", text)
     return [s.strip() for s in sentences if s.strip()]
 
 
-def chunk_text_sliding_window(text):
+def chunk_text_sliding_window(text: str) -> List[str]:
     sentences = split_into_sentences(text)
     chunks = []
-    if len(sentences) < WINDOW_SIZE:
+
+    if len(sentences) < settings.window_size:
         full_text = " ".join(sentences)
-        if len(full_text.split()) >= MIN_WORDS:
+        if len(full_text.split()) >= settings.min_words:
             return [full_text]
         return []
-    for i in range(0, len(sentences) - WINDOW_SIZE + 1, STRIDE):
-        group = sentences[i : i + WINDOW_SIZE]
+
+    for i in range(0, len(sentences) - settings.window_size + 1, settings.stride):
+        group = sentences[i : i + settings.window_size]
         chunk = " ".join(group)
-        if len(chunk.split()) >= MIN_WORDS:
+        if len(chunk.split()) >= settings.min_words:
             chunks.append(chunk)
     return chunks
 
 
-def get_html_from_url(url):
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
-    }
-    try:
-        response = requests.get(url, headers=headers, timeout=10)
-        response.raise_for_status()
-        return response.text
-    except requests.RequestException as e:
-        raise HTTPException(status_code=400, detail=f"Error fetching URL: {str(e)}")
-
-
-# --- Lifespan (Startup/Shutdown) ---
-@contextlib.asynccontextmanager
-async def lifespan(app: FastAPI):
-    # Load Model
-    print("Loading model and tokenizer...")
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    try:
+async def fetch_url_async(url: str) -> str:
+    """Async HTTP fetcher using httpx."""
+    headers = {"User-Agent": "HabrFilterBot/1.0"}
+    async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
         try:
-            tokenizer = AutoTokenizer.from_pretrained(MODEL_PATH)
-        except:
-            print(f"Warning: Local tokenizer not found, downloading {BASE_MODEL_NAME}")
-            tokenizer = AutoTokenizer.from_pretrained(BASE_MODEL_NAME)
-
-        model = AutoModelForSequenceClassification.from_pretrained(MODEL_PATH)
-        model.to(device)
-        model.eval()
-
-        ml_models["model"] = model
-        ml_models["tokenizer"] = tokenizer
-        ml_models["device"] = device
-        print(f"Model loaded on {device}")
-    except Exception as e:
-        print(f"CRITICAL ERROR: Could not load model. {e}")
-        raise e
-
-    yield
-
-    # Clean up resources
-    ml_models.clear()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+            response = await client.get(url, headers=headers)
+            response.raise_for_status()
+            return response.text
+        except httpx.HTTPStatusError as e:
+            logger.error(f"HTTP error fetching {url}: {e}")
+            raise HTTPException(
+                status_code=e.response.status_code, detail="Could not fetch URL"
+            )
+        except httpx.RequestError as e:
+            logger.error(f"Connection error fetching {url}: {e}")
+            raise HTTPException(status_code=400, detail=f"Network error: {str(e)}")
 
 
-app = FastAPI(title="Habr AI Detector API", lifespan=lifespan)
-
-# --- Endpoints ---
-
-
-@app.post("/predict", response_model=AnalyzeResponse)
-def predict(request: AnalyzeRequest):
-    # 1. Get Content
-    if request.url:
-        raw_html = get_html_from_url(request.url)
-        cleaned_text = clean_html(raw_html)
-    elif request.text:
-        cleaned_text = request.text
-    else:
-        raise HTTPException(status_code=400, detail="Provide either 'url' or 'text'")
-
-    # 2. Chunking
-    chunks = chunk_text_sliding_window(cleaned_text)
+def run_inference_sync(chunks: List[str]) -> List[float]:
+    """
+    Runs the actual PyTorch inference.
+    This is blocking, so it will be run in a threadpool.
+    """
     if not chunks:
-        raise HTTPException(
-            status_code=422, detail="Text is too short or empty after cleaning"
-        )
+        return []
 
-    # 3. Inference
-    model = ml_models["model"]
-    tokenizer = ml_models["tokenizer"]
-    device = ml_models["device"]
+    model = ml_resources.model
+    tokenizer = ml_resources.tokenizer
+    device = ml_resources.device
 
     ai_probs = []
-    batch_size = 16  # Slightly larger batch size for API
 
+    # Batch processing
     with torch.no_grad():
-        for i in range(0, len(chunks), batch_size):
-            batch_chunks = chunks[i : i + batch_size]
+        for i in range(0, len(chunks), settings.batch_size):
+            batch_chunks = chunks[i : i + settings.batch_size]
             inputs = tokenizer(
                 batch_chunks,
                 truncation=True,
@@ -175,7 +175,82 @@ def predict(request: AnalyzeRequest):
             # Class 1 is AI
             ai_probs.extend(probs[:, 1].cpu().numpy().tolist())
 
-    # 4. Statistics & Logic
+    return ai_probs
+
+
+# --- 6. Lifespan ---
+@contextlib.asynccontextmanager
+async def lifespan(app: FastAPI):
+    logger.info("Startup: Loading model and tokenizer...")
+    try:
+        # We load these in the main thread during startup (blocking is fine here)
+        ml_resources.device = torch.device(settings.device)
+        ml_resources.tokenizer = AutoTokenizer.from_pretrained(settings.model_path)
+        ml_resources.model = AutoModelForSequenceClassification.from_pretrained(
+            settings.model_path
+        )
+        ml_resources.model.to(ml_resources.device)
+        ml_resources.model.eval()
+
+        logger.info(f"Model loaded successfully on {settings.device}")
+    except Exception as e:
+        logger.critical(f"Failed to load model: {e}")
+        raise e
+
+    yield
+
+    logger.info("Shutdown: Clearing resources...")
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    ml_resources.model = None
+    ml_resources.tokenizer = None
+
+
+# --- 7. App Definition ---
+app = FastAPI(title="Habr AI Detector API", lifespan=lifespan)
+
+# --- 8. Endpoints ---
+
+
+@app.post("/predict", response_model=AnalyzeResponse)
+async def predict(request: AnalyzeRequest):
+    """
+    Analyzes text or URL for AI-generated content.
+    Uses async/await to handle network I/O and threadpools for CPU tasks.
+    """
+
+    # 1. Get Content (Async I/O)
+    if request.url:
+        logger.info(f"Processing URL: {request.url}")
+        raw_html = await fetch_url_async(request.url)
+        # Offload HTML cleaning to threadpool (CPU bound)
+        cleaned_text = await run_in_threadpool(clean_html_sync, raw_html)
+    elif request.text:
+        logger.info("Processing raw text input")
+        cleaned_text = request.text
+    else:
+        raise HTTPException(status_code=400, detail="Provide either 'url' or 'text'")
+
+    # 2. Chunking (CPU bound - fast enough to run here, or offload if huge)
+    chunks = chunk_text_sliding_window(cleaned_text)
+
+    if not chunks:
+        logger.warning("Text too short after cleaning")
+        raise HTTPException(
+            status_code=422, detail="Text is too short or empty after cleaning"
+        )
+
+    # 3. Inference (Heavy CPU/GPU bound - MUST offload)
+    try:
+        ai_probs = await run_in_threadpool(run_inference_sync, chunks)
+    except Exception as e:
+        logger.error(f"Inference failed: {e}")
+        raise HTTPException(status_code=500, detail="Internal model error")
+
+    # 4. Statistics
+    if not ai_probs:
+        raise HTTPException(status_code=422, detail="Could not generate probabilities")
+
     avg_ai_prob = statistics.mean(ai_probs)
     max_ai_prob = max(ai_probs)
     median_ai_prob = statistics.median(ai_probs)
@@ -200,6 +275,8 @@ def predict(request: AnalyzeRequest):
         verdict = "HUMAN-WRITTEN"
         reason = "Consistent low AI probability."
 
+    logger.info(f"Verdict: {verdict} (Avg: {avg_ai_prob:.2f})")
+
     return AnalyzeResponse(
         verdict=verdict,
         reason=reason,
@@ -213,5 +290,16 @@ def predict(request: AnalyzeRequest):
 
 
 @app.get("/health")
-def health_check():
-    return {"status": "ok", "device": str(ml_models.get("device", "unknown"))}
+async def health_check():
+    """
+    K8s/Docker health check.
+    Verifies model is actually loaded in memory.
+    """
+    if ml_resources.model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+
+    return {
+        "status": "ok",
+        "device": str(ml_resources.device),
+        "model": settings.model_path,
+    }

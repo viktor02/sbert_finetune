@@ -1,152 +1,203 @@
+import html
 import json
 import logging
 import os
+import sqlite3
+import sys
 import time
+from typing import List, Optional
 
 import feedparser
 import requests
 import telebot
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
+# --- Configuration ---
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHANNEL_ID = os.getenv("CHANNEL_ID")
 API_URL = os.getenv("API_URL", "http://localhost:8000/predict")
 RSS_URL = "https://habr.com/ru/rss/articles/?fl=ru"
 CHECK_INTERVAL = int(os.getenv("CHECK_INTERVAL", 300))
+DB_PATH = os.getenv("DB_PATH", "/app/data/bot.db")
 
-DB_FILE = os.getenv("DB_FILE", "seen_articles.json")
+# Validate critical config
+if not BOT_TOKEN or not CHANNEL_ID:
+    # We log to stderr so it shows up as an error in container logs
+    print("CRITICAL: BOT_TOKEN and CHANNEL_ID must be set.", file=sys.stderr)
+    sys.exit(1)
 
-# Настройка логирования
+# --- Logging Setup ---
 logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s"
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger(__name__)
+logger = logging.getLogger("HabrBot")
 
-# Инициализация бота
-bot = telebot.TeleBot(BOT_TOKEN)
-
-
-def load_seen_articles():
-    """Загружает список ID уже обработанных статей."""
-    if not os.path.exists(DB_FILE):
-        return []
+# --- Database (SQLite) ---
+def init_db():
+    """Initialize SQLite database for tracking seen articles."""
     try:
-        with open(DB_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except (json.JSONDecodeError, IOError):
-        return []
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute(
+                """CREATE TABLE IF NOT EXISTS seen_articles (
+                    id TEXT PRIMARY KEY,
+                    timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
+                )"""
+            )
+            # Cleanup old entries to keep DB small (keep last 1000)
+            conn.execute(
+                """DELETE FROM seen_articles WHERE id NOT IN (
+                    SELECT id FROM seen_articles ORDER BY timestamp DESC LIMIT 1000
+                )"""
+            )
+    except sqlite3.Error as e:
+        logger.error(f"Database initialization failed: {e}")
+        sys.exit(1)
 
+def is_article_seen(article_id: str) -> bool:
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            cursor = conn.execute("SELECT 1 FROM seen_articles WHERE id = ?", (article_id,))
+            return cursor.fetchone() is not None
+    except sqlite3.Error as e:
+        logger.error(f"DB Read Error: {e}")
+        return False
 
-def save_seen_articles(seen_list):
-    """Сохраняет список ID обработанных статей (храним последние 100)."""
-    # Оставляем только последние 100, чтобы файл не разрастался бесконечно
-    trimmed_list = seen_list[-100:]
-    # Гарантируем, что директория существует
-    os.makedirs(os.path.dirname(os.path.abspath(DB_FILE)), exist_ok=True)
+def mark_article_seen(article_id: str):
+    try:
+        with sqlite3.connect(DB_PATH) as conn:
+            conn.execute("INSERT OR IGNORE INTO seen_articles (id) VALUES (?)", (article_id,))
+    except sqlite3.Error as e:
+        logger.error(f"DB Write Error: {e}")
 
-    with open(DB_FILE, "w", encoding="utf-8") as f:
-        json.dump(trimmed_list, f)
+# --- Network Logic ---
+def get_requests_session():
+    """Creates a session with retry logic."""
+    session = requests.Session()
+    retry = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["POST"]
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session.mount('http://', adapter)
+    session.mount('https://', adapter)
+    return session
 
-
-def check_api(article_url):
-    """Делает запрос к локальному API для проверки статьи."""
+def check_api(article_url: str) -> Optional[dict]:
+    """Queries the classification API."""
     payload = {"url": article_url}
     headers = {"Content-Type": "application/json"}
+    session = get_requests_session()
 
     try:
-        response = requests.post(API_URL, json=payload, headers=headers, timeout=30)
+        response = session.post(API_URL, json=payload, headers=headers, timeout=30)
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
-        logger.error(f"Ошибка при запросе к API ({API_URL}): {e}")
+        logger.error(f"API Request failed for {article_url}: {e}")
         return None
 
+# --- Bot Logic ---
+bot = telebot.TeleBot(BOT_TOKEN)
+
+def send_telegram_notification(entry, api_response):
+    verdict = api_response.get("verdict", "N/A")
+    reason = api_response.get("reason", "No reason provided")
+    avg_score = api_response.get("avg_ai_score", 0)
+
+    # Escape HTML special characters to prevent broken tags
+    safe_title = html.escape(entry.title)
+    safe_reason = html.escape(str(reason))
+    safe_verdict = html.escape(str(verdict))
+
+    icon = "🤖" if "AI" in verdict else "✍️"
+
+    message_text = (
+        f"{icon} <b>Новая статья на Хабре</b>\n\n"
+        f"<a href='{entry.link}'>{safe_title}</a>\n\n"
+        f"<b>Verdict:</b> {safe_verdict}\n"
+        f"<b>Score:</b> {avg_score:.2f}\n"
+        f"<i>{safe_reason}</i>"
+    )
+
+    try:
+        bot.send_message(
+            CHANNEL_ID,
+            message_text,
+            parse_mode="HTML",
+            disable_web_page_preview=False,
+        )
+        logger.info(f"Sent notification for: {entry.title}")
+        return True
+    except telebot.apihelper.ApiTelegramException as e:
+        logger.error(f"Telegram API Error: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Unexpected error sending message: {e}")
+        return False
 
 def process_rss():
-    """Основная функция проверки RSS и отправки сообщений."""
-    logger.info("Проверка RSS ленты...")
+    logger.info("Checking RSS feed...")
 
-    seen_articles = load_seen_articles()
-    feed = feedparser.parse(RSS_URL)
-
-    if feed.bozo:
-        logger.error("Ошибка при парсинге RSS ленты")
+    try:
+        feed = feedparser.parse(RSS_URL)
+    except Exception as e:
+        logger.error(f"Failed to fetch RSS feed: {e}")
         return
 
-    # RSS обычно идет от новых к старым, нам лучше обрабатывать наоборот,
-    # чтобы соблюдать хронологию при первой загрузке, но для мониторинга это не критично.
-    # Проходимся по списку.
+    if feed.bozo:
+        logger.warning(f"RSS Parse Warning (Bozo): {feed.bozo_exception}")
 
-    new_articles_found = False
+    if not feed.entries:
+        logger.info("No entries found in RSS.")
+        return
 
-    # Инвертируем список, чтобы старые (новые для нас) обрабатывались первыми, если их несколько
+    # Process from oldest to newest to maintain timeline
     for entry in reversed(feed.entries):
-        article_id = entry.id  # Уникальный ID статьи в RSS
-        article_url = entry.link
-        article_title = entry.title
+        article_id = entry.id
 
-        if article_id not in seen_articles:
-            logger.info(f"Найдена новая статья: {article_title}")
+        if is_article_seen(article_id):
+            continue
 
-            # 1. Делаем запрос к API
-            api_response = check_api(article_url)
+        logger.info(f"Processing new article: {entry.title}")
 
-            if api_response:
-                verdict = api_response.get("verdict", "N/A")
-                reason = api_response.get("reason", "")
-                avg_score = api_response.get("avg_ai_score", 0)
+        # Check API
+        api_response = check_api(entry.link)
 
-                # Формируем сообщение
-                # Можно добавить эмодзи в зависимости от вердикта
-                icon = "🤖" if "AI" in verdict else "✍️"
+        if not api_response:
+            logger.warning(f"Skipping {entry.title} due to API failure.")
+            # We do NOT mark as seen, so we try again next loop
+            continue
 
-                message_text = (
-                    f"{icon} <b>Новая статья на Хабре</b>\n\n"
-                    f"<a href='{article_url}'>{article_title}</a>\n\n"
-                    f"<b>Verdict:</b> {verdict}\n"
-                    f"<b>Score:</b> {avg_score:.2f}\n"
-                    f"<i>{reason}</i>"
-                )
+        # Send Message
+        success = send_telegram_notification(entry, api_response)
 
-                try:
-                    # 2. Отправляем в Telegram
-                    bot.send_message(
-                        CHANNEL_ID,
-                        message_text,
-                        parse_mode="HTML",
-                        disable_web_page_preview=False,
-                    )
-                    logger.info(f"Сообщение отправлено для: {article_title}")
-
-                    # 3. Добавляем в просмотренные
-                    seen_articles.append(article_id)
-                    new_articles_found = True
-
-                    # Небольшая пауза, чтобы не спамить, если статей много сразу
-                    time.sleep(1)
-
-                except Exception as e:
-                    logger.error(f"Ошибка при отправке в Telegram: {e}")
-            else:
-                logger.warning(
-                    f"Не удалось получить вердикт для {article_url}, пропускаем пока."
-                )
-
-    if new_articles_found:
-        save_seen_articles(seen_articles)
-
+        if success:
+            mark_article_seen(article_id)
+            # Rate limit to avoid hitting Telegram limits
+            time.sleep(2)
 
 def main():
-    logger.info("Бот запущен")
-    logger.info(f"API URL: {API_URL}")
+    logger.info("Starting HabrFilter Bot...")
+
+    # Ensure data directory exists
+    os.makedirs(os.path.dirname(DB_PATH), exist_ok=True)
+    init_db()
+
+    logger.info(f"Monitoring {RSS_URL}")
+    logger.info(f"API Target: {API_URL}")
+
     while True:
         try:
             process_rss()
         except Exception as e:
-            logger.error(f"Критическая ошибка в основном цикле: {e}")
+            logger.exception("Critical error in main loop")
 
-        # Ожидание перед следующей проверкой
         time.sleep(CHECK_INTERVAL)
-
 
 if __name__ == "__main__":
     main()

@@ -1,0 +1,65 @@
+# Use a specific slim version for reproducibility
+FROM python:3.11-slim
+
+# Set environment variables
+# PYTHONDONTWRITEBYTECODE: Prevents Python from writing pyc files to disc
+# PYTHONUNBUFFERED: Ensures logs are flushed immediately (vital for Docker logs)
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    # Hugging Face Cache Directory (so we can control permissions)
+    HF_HOME=/app/model_cache
+
+# Create a non-root user for security
+RUN addgroup --system --gid 1001 appgroup && \
+    adduser --system --uid 1001 --gid 1001 appuser
+
+# Set work directory
+WORKDIR /app
+
+# Install system dependencies (curl is useful for healthchecks)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install PyTorch CPU version first (to keep image size small ~700MB saved)
+# If you have a GPU node, remove the --index-url part
+RUN pip install --no-cache-dir torch torchvision --index-url https://download.pytorch.org/whl/cpu
+
+# Copy requirements and install dependencies
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Create the model cache directory and give the user permissions
+RUN mkdir -p $HF_HOME && chown -R appuser:appuser $HF_HOME
+
+# Copy the application code
+# We use --chown to ensure the non-root user owns the files
+COPY --chown=appuser:appuser src/api.py .
+
+# --- Environment Configuration (Defaults) ---
+# You can override these in your docker-compose or k8s manifest
+ENV MODEL_PATH="viktor02/sbert_classification_ru_ai_texts" \
+    WINDOW_SIZE=3 \
+    STRIDE=1 \
+    MIN_WORDS=10 \
+    LOG_LEVEL="INFO" \
+    # Number of workers for uvicorn (usually 1 per container in K8s)
+    WORKERS=1
+
+# Switch to non-root user
+USER appuser
+
+# Pre-download the model during build (Optional but recommended for faster startup)
+# Uncomment the next line if you want the model baked into the image:
+# RUN python -c "from transformers import AutoTokenizer, AutoModelForSequenceClassification; AutoTokenizer.from_pretrained('viktor02/sbert_classification_ru_ai_texts'); AutoModelForSequenceClassification.from_pretrained('viktor02/sbert_classification_ru_ai_texts')"
+
+# Expose the port
+EXPOSE 8000
+
+# Healthcheck (Docker will restart the container if this fails)
+HEALTHCHECK --interval=30s --timeout=10s --start-period=10s --retries=3 \
+  CMD curl -f http://localhost:8000/health || exit 1
+
+# Start the application
+CMD ["uvicorn", "api:app", "--host", "0.0.0.0", "--port", "8000", "--proxy-headers"]
