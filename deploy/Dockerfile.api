@@ -31,7 +31,7 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
 # Create the model cache directory and give the user permissions
-RUN mkdir -p $HF_HOME && chown -R appuser:appuser $HF_HOME
+RUN mkdir -p $HF_HOME && chown -R appuser:appgroup $HF_HOME
 
 # Copy the application code
 # We use --chown to ensure the non-root user owns the files
