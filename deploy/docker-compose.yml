@@ -11,6 +11,7 @@ services:
       # Persist HuggingFace cache so we don't re-download models on restart
       - ./hf_cache:/app/model_cache
     restart: unless-stopped
+    env_file: .env
     # Healthcheck is already in Dockerfile, but this ensures Compose waits for it
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
@@ -24,6 +25,7 @@ services:
       context: .
       dockerfile: Dockerfile.bot
     container_name: habr_filter_bot
+    env_file: .env
     volumes:
       # Persist the SQLite database
       - ./bot_data:/app/data

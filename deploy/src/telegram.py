@@ -31,9 +31,10 @@ if not BOT_TOKEN or not CHANNEL_ID:
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
+    handlers=[logging.StreamHandler(sys.stdout)],
 )
 logger = logging.getLogger("HabrBot")
+
 
 # --- Database (SQLite) ---
 def init_db():
@@ -56,36 +57,44 @@ def init_db():
         logger.error(f"Database initialization failed: {e}")
         sys.exit(1)
 
+
 def is_article_seen(article_id: str) -> bool:
     try:
         with sqlite3.connect(DB_PATH) as conn:
-            cursor = conn.execute("SELECT 1 FROM seen_articles WHERE id = ?", (article_id,))
+            cursor = conn.execute(
+                "SELECT 1 FROM seen_articles WHERE id = ?", (article_id,)
+            )
             return cursor.fetchone() is not None
     except sqlite3.Error as e:
         logger.error(f"DB Read Error: {e}")
         return False
 
+
 def mark_article_seen(article_id: str):
     try:
         with sqlite3.connect(DB_PATH) as conn:
-            conn.execute("INSERT OR IGNORE INTO seen_articles (id) VALUES (?)", (article_id,))
+            conn.execute(
+                "INSERT OR IGNORE INTO seen_articles (id) VALUES (?)", (article_id,)
+            )
     except sqlite3.Error as e:
         logger.error(f"DB Write Error: {e}")
+
 
 # --- Network Logic ---
 def get_requests_session():
     """Creates a session with retry logic."""
     session = requests.Session()
     retry = Retry(
-        total=3,
+        total=5,
         backoff_factor=1,
         status_forcelist=[500, 502, 503, 504],
-        allowed_methods=["POST"]
+        allowed_methods=["POST"],
     )
     adapter = HTTPAdapter(max_retries=retry)
-    session.mount('http://', adapter)
-    session.mount('https://', adapter)
+    session.mount("http://", adapter)
+    session.mount("https://", adapter)
     return session
+
 
 def check_api(article_url: str) -> Optional[dict]:
     """Queries the classification API."""
@@ -94,15 +103,17 @@ def check_api(article_url: str) -> Optional[dict]:
     session = get_requests_session()
 
     try:
-        response = session.post(API_URL, json=payload, headers=headers, timeout=30)
+        response = session.post(API_URL, json=payload, headers=headers, timeout=600)
         response.raise_for_status()
         return response.json()
     except requests.exceptions.RequestException as e:
         logger.error(f"API Request failed for {article_url}: {e}")
         return None
 
+
 # --- Bot Logic ---
 bot = telebot.TeleBot(BOT_TOKEN)
+
 
 def send_telegram_notification(entry, api_response):
     verdict = api_response.get("verdict", "N/A")
@@ -139,6 +150,7 @@ def send_telegram_notification(entry, api_response):
     except Exception as e:
         logger.error(f"Unexpected error sending message: {e}")
         return False
+
 
 def process_rss():
     logger.info("Checking RSS feed...")
@@ -181,6 +193,7 @@ def process_rss():
             # Rate limit to avoid hitting Telegram limits
             time.sleep(2)
 
+
 def main():
     logger.info("Starting HabrFilter Bot...")
 
@@ -198,6 +211,7 @@ def main():
             logger.exception("Critical error in main loop")
 
         time.sleep(CHECK_INTERVAL)
+
 
 if __name__ == "__main__":
     main()
