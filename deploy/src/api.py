@@ -80,6 +80,7 @@ class QueueItem:
     chunks: List[str]
     future: asyncio.Future
     arrival_time: float
+    pass
 
 
 # --- 4. Global Resources (State Management) ---
@@ -138,27 +139,20 @@ def chunk_text_sliding_window(text: str) -> List[str]:
     return chunks
 
 
-def _run_torch_inference(chunks: List[str]) -> List[float]:
-    """
-    Actual GPU/CPU inference function.
-    This MUST be run in a threadpool or strictly serialized to ensure
-    no conflicts with the async event loop.
-    """
+def _run_torch_inference(chunks: List[str]) -> Tuple[List[float], List[float]]:
     if not chunks:
-        return []
+        return [], []
 
     ai_probs = []
+    ai_logits = []
     model = resources.model
     tokenizer = resources.tokenizer
     device = resources.device
 
-    # Mathematical: $P(AI) = Softmax(Logits)_{class=1}$
-    # We use torch.no_grad() to strictly avoid building a computation graph (Memory Leak prevention)
     with torch.no_grad():
         for i in range(0, len(chunks), settings.batch_size):
             batch_chunks = chunks[i : i + settings.batch_size]
 
-            # Move inputs to device
             inputs = tokenizer(
                 batch_chunks,
                 truncation=True,
@@ -168,16 +162,18 @@ def _run_torch_inference(chunks: List[str]) -> List[float]:
             ).to(device)
 
             outputs = model(**inputs)
-            probs = F.softmax(outputs.logits, dim=-1)
+            
+            # 1. Logits (Raw Score)
+            batch_logits = outputs.logits[:, 1]
+            # 2. Probabilities (Calibrated Score)
+            batch_probs = F.softmax(outputs.logits, dim=-1)[:, 1]
 
-            # Detach immediately and ensure moving to CPU to free VRAM
-            ai_probs.extend(probs[:, 1].cpu().numpy().tolist())
+            ai_logits.extend(batch_logits.cpu().numpy().tolist())
+            ai_probs.extend(batch_probs.cpu().numpy().tolist())
 
-            # Explicitly delete tensors to aid GC inside the loop if batch is huge
-            del inputs, outputs, probs
+            del inputs, outputs, batch_logits, batch_probs
 
-    return ai_probs
-
+    return ai_probs, ai_logits
 
 # --- 6. Queue Worker ---
 
@@ -281,7 +277,6 @@ async def predict(request: AnalyzeRequest):
 
     # 1. Fetch / Clean Data
     if request.url:
-        # Use the shared client
         try:
             resp = await resources.http_client.get(request.url)
             resp.raise_for_status()
@@ -305,6 +300,8 @@ async def predict(request: AnalyzeRequest):
 
     # 3. Enqueue for Inference
     loop = asyncio.get_running_loop()
+    
+    # --- [RESTORED MISSING LINES] ---
     future = loop.create_future()
     item = QueueItem(
         request_id=str(time.time()),
@@ -318,42 +315,49 @@ async def predict(request: AnalyzeRequest):
         await asyncio.wait_for(resources.inference_queue.put(item), timeout=2.0)
     except asyncio.TimeoutError:
         raise HTTPException(status_code=503, detail="Server busy (Queue full)")
-
+    
     # 4. Await Result
     queue_ep_time = time.time()
     try:
-        ai_probs = await future
+        # Unpack both PROBS and LOGITS
+        ai_probs, ai_logits = await future
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
 
-    # 5. Post-Processing Stats
+    # 5. Post-Processing Logic (New Method)
     if not ai_probs:
         raise HTTPException(status_code=422, detail="Model returned no predictions")
 
-    avg_ai_prob = statistics.mean(ai_probs)
-    max_ai_prob = max(ai_probs)
-    median_ai_prob = statistics.median(ai_probs)
-    suspicious_chunks = sum(1 for p in ai_probs if p > 0.5)
+    # -- Math Logic --
+    avg_logit = statistics.mean(ai_logits)
+    import math
+    try:
+        global_prob_from_logits = 1 / (1 + math.exp(-avg_logit))
+    except OverflowError:
+        global_prob_from_logits = 0.0 if avg_logit < 0 else 1.0
 
-    scored_chunks = sorted(zip(chunks, ai_probs), key=lambda x: x[1], reverse=True)
-    top_chunks = [ChunkScore(text=c, score=s) for c, s in scored_chunks[:3]]
-
-    # Verdict Logic
-    # If $Avg(P) > 0.5$, we flag as AI
-    if avg_ai_prob > 0.5:
+    # Top-K Stats
+    sorted_indices = sorted(range(len(ai_probs)), key=lambda k: ai_probs[k], reverse=True)
+    top_k_count = max(3, int(len(chunks) * 0.2))
+    top_indices = sorted_indices[:top_k_count]
+    top_k_avg = statistics.mean([ai_probs[i] for i in top_indices])
+    prob_variance = statistics.variance(ai_probs) if len(ai_probs) > 1 else 0.0
+    
+    # Verdict
+    if global_prob_from_logits > 0.5:
         verdict = "AI-GENERATED"
-        reason = "High average AI probability."
-    elif suspicious_chunks / len(chunks) > 0.25:
-        verdict = "LIKELY AI (MIXED)"
-        reason = (
-            f"Significant mixed content ({suspicious_chunks}/{len(chunks)} chunks)."
-        )
-    elif avg_ai_prob > 0.25 and max_ai_prob > 0.8:
+        reason = f"Global evidence suggests AI origin (Logit-Prob: {global_prob_from_logits:.2f})."
+    elif top_k_avg > 0.85:
+        verdict = "LIKELY AI (EDITED/MIXED)"
+        reason = f"High AI signals in {len(top_indices)} specific segments."
+    elif global_prob_from_logits > 0.3 and prob_variance > 0.1:
         verdict = "SUSPICIOUS"
-        reason = "Generally human, but contains high-confidence AI spikes."
+        reason = "Inconsistent writing style with AI-like anomalies."
     else:
         verdict = "HUMAN-WRITTEN"
-        reason = "Consistent human probability patterns."
+        reason = "Consistent human patterns across text."
+
+    top_chunks = [ChunkScore(text=chunks[i], score=ai_probs[i]) for i in top_indices[:3]]
 
     total_time = (time.time() - start_time) * 1000
     queue_wait = (queue_ep_time - start_time) * 1000
@@ -361,16 +365,15 @@ async def predict(request: AnalyzeRequest):
     return AnalyzeResponse(
         verdict=verdict,
         reason=reason,
-        avg_ai_score=avg_ai_prob,
-        max_ai_score=max_ai_prob,
-        median_ai_score=median_ai_prob,
+        avg_ai_score=global_prob_from_logits, 
+        max_ai_score=max(ai_probs),
+        median_ai_score=statistics.median(ai_probs),
         total_chunks=len(chunks),
-        suspicious_chunks_count=suspicious_chunks,
+        suspicious_chunks_count=sum(1 for p in ai_probs if p > 0.5),
         top_suspicious_chunks=top_chunks,
         processing_time_ms=round(total_time, 2),
         queue_wait_time_ms=round(queue_wait, 2),
     )
-
 
 @app.get("/health")
 async def health_check():
