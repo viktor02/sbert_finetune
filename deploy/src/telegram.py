@@ -128,8 +128,7 @@ def send_telegram_notification(entry, api_response):
     icon = "🤖" if "AI" in verdict else "✍️"
 
     message_text = (
-        f"{icon} <b>Новая статья на Хабре</b>\n\n"
-        f"<a href='{entry.link}'>{safe_title}</a>\n\n"
+        f"{icon} <a href='{entry.link}'>{safe_title}</a>\n\n"
         f"<b>Verdict:</b> {safe_verdict}\n"
         f"<b>Score:</b> {avg_score:.2f}\n"
         f"<i>{safe_reason}</i>"

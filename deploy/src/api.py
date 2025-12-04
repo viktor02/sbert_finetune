@@ -1,21 +1,24 @@
+import asyncio
 import contextlib
 import logging
 import re
 import statistics
-from typing import Any, Dict, List, Optional
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Tuple
 
 import httpx
 import torch
 import torch.nn.functional as F
 from bs4 import BeautifulSoup
-from fastapi import BackgroundTasks, FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.concurrency import run_in_threadpool
 from pydantic import BaseModel, Field
 from pydantic_settings import BaseSettings
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 
 
-# --- 1. Configuration (Cloud Ready) ---
+# --- 1. Configuration ---
 class Settings(BaseSettings):
     # Model Config
     hf_model_id: str = "viktor02/sbert_classification_ru_ai_texts"
@@ -28,7 +31,8 @@ class Settings(BaseSettings):
     window_size: int = 3
     stride: int = 1
     min_words: int = 10
-    batch_size: int = 16
+    batch_size: int = 16  # Layout on GPU
+    max_queue_size: int = 100  # Backpressure limit
     device: str = "cuda" if torch.cuda.is_available() else "cpu"
 
     # App Config
@@ -44,18 +48,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger("api")
 
-
-# --- 3. Global State ---
-class MLResources:
-    model = None
-    tokenizer = None
-    device = None
+# --- 3. Data Models ---
 
 
-ml_resources = MLResources()
-
-
-# --- 4. Data Models ---
 class AnalyzeRequest(BaseModel):
     url: Optional[str] = Field(None, description="URL of the article to check")
     text: Optional[str] = Field(None, description="Raw text to check (if no URL)")
@@ -76,24 +71,45 @@ class AnalyzeResponse(BaseModel):
     suspicious_chunks_count: int
     top_suspicious_chunks: List[ChunkScore]
     processing_time_ms: Optional[float] = None
+    queue_wait_time_ms: Optional[float] = None
 
+
+@dataclass
+class QueueItem:
+    request_id: str
+    chunks: List[str]
+    future: asyncio.Future
+    arrival_time: float
+
+
+# --- 4. Global Resources (State Management) ---
+class GlobalResources:
+    def __init__(self):
+        self.model = None
+        self.tokenizer = None
+        self.device = None
+        self.http_client: Optional[httpx.AsyncClient] = None
+        self.inference_queue: Optional[asyncio.Queue] = None
+        self.worker_task: Optional[asyncio.Task] = None
+
+
+resources = GlobalResources()
 
 # --- 5. Helper Functions ---
 
 
 def clean_html_sync(html_content: str) -> str:
-    """CPU-bound HTML cleaning."""
+    """CPU-bound HTML cleaning. Removes tags and scripts."""
     if not html_content:
         return ""
     soup = BeautifulSoup(html_content, "html.parser")
 
-    # Remove unwanted tags
     for element in soup(
         ["script", "style", "meta", "noscript", "iframe", "svg", "path"]
     ):
         element.decompose()
 
-    # Remove code blocks (optional, based on your logic)
+    # Also remove code blocks to avoid false positives on code syntax
     for element in soup(["pre", "code"]):
         element.decompose()
 
@@ -101,17 +117,13 @@ def clean_html_sync(html_content: str) -> str:
     return " ".join(text.split())
 
 
-def split_into_sentences(text: str) -> List[str]:
-    # Improved regex to handle common abbreviations could go here,
-    # but keeping it simple for performance.
-    sentences = re.split(r"(?<=[.!?])\s+", text)
-    return [s.strip() for s in sentences if s.strip()]
-
-
 def chunk_text_sliding_window(text: str) -> List[str]:
-    sentences = split_into_sentences(text)
-    chunks = []
+    """Splits text into sliding window chunks."""
+    # Simple regex for sentence splitting
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    sentences = [s.strip() for s in sentences if s.strip()]
 
+    chunks = []
     if len(sentences) < settings.window_size:
         full_text = " ".join(sentences)
         if len(full_text.split()) >= settings.min_words:
@@ -126,42 +138,27 @@ def chunk_text_sliding_window(text: str) -> List[str]:
     return chunks
 
 
-async def fetch_url_async(url: str) -> str:
-    """Async HTTP fetcher using httpx."""
-    headers = {"User-Agent": "HabrFilterBot/1.0"}
-    async with httpx.AsyncClient(follow_redirects=True, timeout=10.0) as client:
-        try:
-            response = await client.get(url, headers=headers)
-            response.raise_for_status()
-            return response.text
-        except httpx.HTTPStatusError as e:
-            logger.error(f"HTTP error fetching {url}: {e}")
-            raise HTTPException(
-                status_code=e.response.status_code, detail="Could not fetch URL"
-            )
-        except httpx.RequestError as e:
-            logger.error(f"Connection error fetching {url}: {e}")
-            raise HTTPException(status_code=400, detail=f"Network error: {str(e)}")
-
-
-def run_inference_sync(chunks: List[str]) -> List[float]:
+def _run_torch_inference(chunks: List[str]) -> List[float]:
     """
-    Runs the actual PyTorch inference.
-    This is blocking, so it will be run in a threadpool.
+    Actual GPU/CPU inference function.
+    This MUST be run in a threadpool or strictly serialized to ensure
+    no conflicts with the async event loop.
     """
     if not chunks:
         return []
 
-    model = ml_resources.model
-    tokenizer = ml_resources.tokenizer
-    device = ml_resources.device
-
     ai_probs = []
+    model = resources.model
+    tokenizer = resources.tokenizer
+    device = resources.device
 
-    # Batch processing
+    # Mathematical: $P(AI) = Softmax(Logits)_{class=1}$
+    # We use torch.no_grad() to strictly avoid building a computation graph (Memory Leak prevention)
     with torch.no_grad():
         for i in range(0, len(chunks), settings.batch_size):
             batch_chunks = chunks[i : i + settings.batch_size]
+
+            # Move inputs to device
             inputs = tokenizer(
                 batch_chunks,
                 truncation=True,
@@ -172,110 +169,194 @@ def run_inference_sync(chunks: List[str]) -> List[float]:
 
             outputs = model(**inputs)
             probs = F.softmax(outputs.logits, dim=-1)
-            # Class 1 is AI
+
+            # Detach immediately and ensure moving to CPU to free VRAM
             ai_probs.extend(probs[:, 1].cpu().numpy().tolist())
+
+            # Explicitly delete tensors to aid GC inside the loop if batch is huge
+            del inputs, outputs, probs
 
     return ai_probs
 
 
-# --- 6. Lifespan ---
+# --- 6. Queue Worker ---
+
+
+async def inference_worker():
+    """
+    Consumer: continuously pulls requests from the queue.
+    Processes requests serially to prevent GPU OOM.
+    """
+    logger.info("Inference worker started.")
+    while True:
+        item: QueueItem = await resources.inference_queue.get()
+
+        try:
+            # Check formatting or empty chunks
+            if not item.chunks:
+                item.future.set_result([])
+                continue
+
+            # Run inference in a separate thread to prevent blocking the asyncio loop
+            # Even though we are in a worker, the inference is CPU blocking until GPU dispatch
+            logger.debug(
+                f"Processing request {item.request_id} with {len(item.chunks)} chunks"
+            )
+
+            probs = await run_in_threadpool(_run_torch_inference, item.chunks)
+
+            if not item.future.done():
+                item.future.set_result(probs)
+
+        except Exception as e:
+            logger.error(f"Error processing request {item.request_id}: {e}")
+            if not item.future.done():
+                item.future.set_exception(e)
+        finally:
+            resources.inference_queue.task_done()
+
+
+# --- 7. Lifespan (Startup/Shutdown) ---
+
+
 @contextlib.asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info("Startup: Loading model and tokenizer...")
+    # --- Startup ---
+    logger.info("Startup: Initializing resources...")
+
+    # 1. Load Model
+    resources.device = torch.device(settings.device)
     try:
-        # We load these in the main thread during startup (blocking is fine here)
-        ml_resources.device = torch.device(settings.device)
-        ml_resources.tokenizer = AutoTokenizer.from_pretrained(settings.model_path)
-        ml_resources.model = AutoModelForSequenceClassification.from_pretrained(
+        resources.tokenizer = AutoTokenizer.from_pretrained(settings.model_path)
+        resources.model = AutoModelForSequenceClassification.from_pretrained(
             settings.model_path
         )
-        ml_resources.model.to(ml_resources.device)
-        ml_resources.model.eval()
-
-        logger.info(f"Model loaded successfully on {settings.device}")
+        resources.model.to(resources.device)
+        resources.model.eval()
+        logger.info(f"Model loaded on {settings.device}")
     except Exception as e:
         logger.critical(f"Failed to load model: {e}")
         raise e
 
+    resources.http_client = httpx.AsyncClient(
+        follow_redirects=True, timeout=10.0, headers={"User-Agent": "HabrFilterBot/1.0"}
+    )
+
+    # 3. Initialize & Start Queue
+    resources.inference_queue = asyncio.Queue(maxsize=settings.max_queue_size)
+    resources.worker_task = asyncio.create_task(inference_worker())
+
     yield
 
-    logger.info("Shutdown: Clearing resources...")
+    # --- Shutdown ---
+    logger.info("Shutdown: Cleaning up resources...")
+
+    # 1. Cancel Worker
+    if resources.worker_task:
+        resources.worker_task.cancel()
+        try:
+            await resources.worker_task
+        except asyncio.CancelledError:
+            pass
+
+    # 2. Close HTTP Client
+    await resources.http_client.aclose()
+
+    # 3. Clear GPU Memory
+    resources.model = None
+    resources.tokenizer = None
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
-    ml_resources.model = None
-    ml_resources.tokenizer = None
 
 
-# --- 7. App Definition ---
+# --- 8. App Definition ---
 app = FastAPI(title="Habr AI Detector API", lifespan=lifespan)
 
-# --- 8. Endpoints ---
+# --- 9. Endpoints ---
 
 
 @app.post("/predict", response_model=AnalyzeResponse)
 async def predict(request: AnalyzeRequest):
-    """
-    Analyzes text or URL for AI-generated content.
-    Uses async/await to handle network I/O and threadpools for CPU tasks.
-    """
+    start_time = time.time()
 
-    # 1. Get Content (Async I/O)
+    # 1. Fetch / Clean Data
     if request.url:
-        logger.info(f"Processing URL: {request.url}")
-        raw_html = await fetch_url_async(request.url)
-        # Offload HTML cleaning to threadpool (CPU bound)
-        cleaned_text = await run_in_threadpool(clean_html_sync, raw_html)
+        # Use the shared client
+        try:
+            resp = await resources.http_client.get(request.url)
+            resp.raise_for_status()
+            raw_text = resp.text
+            cleaned_text = await run_in_threadpool(clean_html_sync, raw_text)
+        except httpx.HTTPStatusError as e:
+            raise HTTPException(
+                status_code=e.response.status_code, detail="Upstream Fetch Error"
+            )
+        except httpx.RequestError as e:
+            raise HTTPException(status_code=503, detail=f"Network error: {e}")
     elif request.text:
-        logger.info("Processing raw text input")
         cleaned_text = request.text
     else:
-        raise HTTPException(status_code=400, detail="Provide either 'url' or 'text'")
+        raise HTTPException(status_code=400, detail="Provide 'url' or 'text'")
 
-    # 2. Chunking (CPU bound - fast enough to run here, or offload if huge)
+    # 2. Chunking
     chunks = chunk_text_sliding_window(cleaned_text)
-
     if not chunks:
-        logger.warning("Text too short after cleaning")
-        raise HTTPException(
-            status_code=422, detail="Text is too short or empty after cleaning"
-        )
+        raise HTTPException(status_code=422, detail="Text too short to analyze")
 
-    # 3. Inference (Heavy CPU/GPU bound - MUST offload)
+    # 3. Enqueue for Inference
+    loop = asyncio.get_running_loop()
+    future = loop.create_future()
+    item = QueueItem(
+        request_id=str(time.time()),
+        chunks=chunks,
+        future=future,
+        arrival_time=time.time(),
+    )
+
     try:
-        ai_probs = await run_in_threadpool(run_inference_sync, chunks)
-    except Exception as e:
-        logger.error(f"Inference failed: {e}")
-        raise HTTPException(status_code=500, detail="Internal model error")
+        # Push to queue (with timeout for backpressure)
+        await asyncio.wait_for(resources.inference_queue.put(item), timeout=2.0)
+    except asyncio.TimeoutError:
+        raise HTTPException(status_code=503, detail="Server busy (Queue full)")
 
-    # 4. Statistics
+    # 4. Await Result
+    queue_ep_time = time.time()
+    try:
+        ai_probs = await future
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Inference error: {str(e)}")
+
+    # 5. Post-Processing Stats
     if not ai_probs:
-        raise HTTPException(status_code=422, detail="Could not generate probabilities")
+        raise HTTPException(status_code=422, detail="Model returned no predictions")
 
     avg_ai_prob = statistics.mean(ai_probs)
     max_ai_prob = max(ai_probs)
     median_ai_prob = statistics.median(ai_probs)
     suspicious_chunks = sum(1 for p in ai_probs if p > 0.5)
 
-    # Prepare top chunks
-    scored_chunks = list(zip(chunks, ai_probs))
-    scored_chunks.sort(key=lambda x: x[1], reverse=True)
+    scored_chunks = sorted(zip(chunks, ai_probs), key=lambda x: x[1], reverse=True)
     top_chunks = [ChunkScore(text=c, score=s) for c, s in scored_chunks[:3]]
 
-    # 5. Verdict Logic
+    # Verdict Logic
+    # If $Avg(P) > 0.5$, we flag as AI
     if avg_ai_prob > 0.5:
         verdict = "AI-GENERATED"
-        reason = "High average AI probability across the text."
+        reason = "High average AI probability."
     elif suspicious_chunks / len(chunks) > 0.25:
         verdict = "LIKELY AI (MIXED)"
-        reason = f"Significant portion ({suspicious_chunks}/{len(chunks)}) of chunks look like AI."
+        reason = (
+            f"Significant mixed content ({suspicious_chunks}/{len(chunks)} chunks)."
+        )
     elif avg_ai_prob > 0.25 and max_ai_prob > 0.8:
         verdict = "SUSPICIOUS"
-        reason = "Elevated average score with high-confidence AI spikes."
+        reason = "Generally human, but contains high-confidence AI spikes."
     else:
         verdict = "HUMAN-WRITTEN"
-        reason = "Consistent low AI probability."
+        reason = "Consistent human probability patterns."
 
-    logger.info(f"Verdict: {verdict} (Avg: {avg_ai_prob:.2f})")
+    total_time = (time.time() - start_time) * 1000
+    queue_wait = (queue_ep_time - start_time) * 1000
 
     return AnalyzeResponse(
         verdict=verdict,
@@ -286,20 +367,12 @@ async def predict(request: AnalyzeRequest):
         total_chunks=len(chunks),
         suspicious_chunks_count=suspicious_chunks,
         top_suspicious_chunks=top_chunks,
+        processing_time_ms=round(total_time, 2),
+        queue_wait_time_ms=round(queue_wait, 2),
     )
 
 
 @app.get("/health")
 async def health_check():
-    """
-    K8s/Docker health check.
-    Verifies model is actually loaded in memory.
-    """
-    if ml_resources.model is None:
-        raise HTTPException(status_code=503, detail="Model not loaded")
-
-    return {
-        "status": "ok",
-        "device": str(ml_resources.device),
-        "model": settings.model_path,
-    }
+    q_size = resources.inference_queue.qsize() if resources.inference_queue else 0
+    return {"status": "ok", "device": str(resources.device), "queue_depth": q_size}
